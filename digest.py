@@ -1,5 +1,7 @@
 import csv
+import json
 import os
+import re
 import smtplib
 import time
 from datetime import date, datetime
@@ -14,43 +16,57 @@ from tavily import TavilyClient
 
 load_dotenv()
 
-TAVILY_API_KEY  = os.environ["TAVILY_API_KEY"]
+TAVILY_API_KEY   = os.environ["TAVILY_API_KEY"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
-EMAIL_PASSWORD  = os.environ["EMAIL_PASSWORD"]
-APOFY_TOKEN     = os.environ.get("APIFY_TOKEN", "")   # optional – wird übersprungen wenn leer
+EMAIL_PASSWORD   = os.environ["EMAIL_PASSWORD"]
+APIFY_TOKEN      = os.environ.get("APIFY_TOKEN", "")
 EMAIL_FROM = "mr.m.heyden@gmail.com"
 EMAIL_TO   = "mr.m.heyden@gmail.com"
 
 DB_FILE   = "seen_articles.csv"
 DB_FIELDS = ["url", "title", "snippet", "source", "query", "first_seen"]
 
-# ---------------------------------------------------------------------------
-# Relevanzkontext – was "BPM", "GRC" etc. für uns bedeutet
-# ---------------------------------------------------------------------------
-RELEVANCE_CONTEXT = """
-Relevante Themen (NUR diese sollen behalten werden):
-- Business Process Management (BPM) im Unternehmenskontext
-- GBTEC, BIC Platform, BIC Process Design, BIC EAM, BIC Process Executing, BIC GRC
-- Process Mining, Process Automation, Prozessoptimierung
-- Governance, Risk & Compliance (GRC) im Enterprise-Bereich
-- Enterprise Architecture Management (EAM)
-- Digitale Transformation von Unternehmensprozessen
-- Finance-Software, ERP-Integration mit BPM
-
-NICHT relevant – diese sollen herausgefiltert werden:
-- BPM = Beats Per Minute (Musik, Sport, Fitness)
-- BPM = Brand & Product Management (Marketing)
-- GRC = Gaming, Grafikkarten, unrelated tech
-- Allgemeine HR-, Marketing- oder Sales-Posts ohne BPM-Bezug
-- Posts die nur zufällig ein Keyword enthalten ohne inhaltlichen Bezug
-"""
-
-tavily   = TavilyClient(api_key=TAVILY_API_KEY)
+tavily           = TavilyClient(api_key=TAVILY_API_KEY)
 anthropic_client = Anthropic(api_key=ANTHROPIC_API_KEY)
 
+# ---------------------------------------------------------------------------
+# Relevanzkontext  –  abgeleitet aus gbtec.com-Analyse
+# ---------------------------------------------------------------------------
+RELEVANCE_CONTEXT = """
+Du filterst Ergebnisse fuer einen Sales-Berater, der GBTEC-Software (BIC Platform) verkauft.
+
+BEHALTEN – Posts/Artikel die eines dieser Signale zeigen:
+  Produkt-Signale:
+    - GBTEC, BIC Platform, BIC Process Design, BIC EAM, BIC GRC, BIC Process Execution, Apromore
+    - Konkurrenten: SAP Signavio, Celonis, LeanIX, Nintex, ARIS, Software AG, Camunda
+    - Vergleiche: "Signavio vs", "Celonis vs", "LeanIX vs", "best BPM tool", "BPM software evaluation"
+
+  Kaufsignal-Themen (Unternehmen haben ein Problem das GBTEC loest):
+    - SAP S/4HANA Migration/Transformation/Einfuehrung
+    - Prozesstransparenz fehlt, Prozessdokumentation, Prozessmodellierung
+    - Workflow-Automatisierung, No-Code/Low-Code, Citizen Developer
+    - Enterprise Architecture, IT-Rationalisierung, Application Portfolio Management
+    - DORA, NIS2, MaRisk, ISO 27001, CSRD, ESG-Reporting, Compliance-Druck
+    - Process Mining, Prozessanalyse, Bottleneck-Erkennung
+    - Digitale Transformation als Projekt/Initiative angekuendigt
+    - Neue Rolle: CDO, CIO, Head of Process Excellence, Chief Risk Officer
+
+  Branchen-Signale (GBTEC-Zielbranchen):
+    - Finance & Insurance, Banking, Versicherung
+    - Manufacturing, Automotive, Logistik
+    - Energy & Utilities, Healthcare, Pharma
+    - Oeffentliche Verwaltung, Public Sector
+
+HERAUSFILTERN:
+  - BPM = Beats Per Minute, Sport, Fitness, Musik
+  - GRC = Gaming, Grafikkarten
+  - Allgemeine Marketing-, HR- oder Sales-Posts ohne Prozess/Compliance-Bezug
+  - Jobangebote ohne inhaltlichen Kontext
+  - Posts die ein Keyword nur zufaellig erwaehnen
+"""
 
 # ---------------------------------------------------------------------------
-# Artikel-Datenbank (CSV)
+# Datenbank
 # ---------------------------------------------------------------------------
 
 def load_db() -> dict:
@@ -74,34 +90,58 @@ def save_new_articles(new_articles: list):
 
 
 # ---------------------------------------------------------------------------
-# Quelle 1: Tavily-Suche (Web + LinkedIn-Artikel)
+# Quelle 1: Tavily  –  Web + LinkedIn-Artikel
 # ---------------------------------------------------------------------------
 
 TAVILY_QUERIES = [
-    # GBTEC direkt – präzise, kein Rauschen
-    dict(query='GBTEC "BIC Platform" OR "BIC Process" OR "BPM"',
+
+    # ── GBTEC direkt ──────────────────────────────────────────────────────
+    dict(query='GBTEC "BIC Platform" OR "BIC Process Design" OR "BIC EAM"',
          include_domains=["linkedin.com"], search_depth="advanced", max_results=5),
-    dict(query='GBTEC "Process Mining" OR "GRC" OR "EAM"',
+    dict(query='GBTEC "Process Mining" OR "BIC GRC" OR "Apromore"',
          include_domains=["linkedin.com"], search_depth="advanced", max_results=5),
     dict(query='GBTEC site:linkedin.com/pulse',
          search_depth="advanced", max_results=5),
-    # BIC Produkte – immer mit GBTEC verankert
-    dict(query='"BIC Process Design" GBTEC',
-         include_domains=["linkedin.com"], search_depth="advanced", max_results=5),
-    dict(query='"BIC EAM" OR "Enterprise Architecture Management" GBTEC',
-         include_domains=["linkedin.com"], search_depth="advanced", max_results=5),
-    dict(query='"BIC Process Executing" OR "BIC GRC" GBTEC',
-         include_domains=["linkedin.com"], search_depth="advanced", max_results=5),
-    # BPM/GRC Trends – immer mit "business process" ausgeschrieben
-    dict(query='"business process management" software trends 2025 2026',
-         include_domains=["linkedin.com/pulse"], search_depth="advanced", max_results=5),
-    dict(query='"Process Mining" enterprise software 2025 2026',
-         include_domains=["linkedin.com"], search_depth="advanced", max_results=5),
-    dict(query='"Governance Risk Compliance" enterprise software trends',
-         include_domains=["linkedin.com"], search_depth="advanced", max_results=5),
-    # Externe News über GBTEC
-    dict(query='GBTEC',
+    dict(query='GBTEC news 2025 2026',
          exclude_domains=["linkedin.com"], search_depth="basic", max_results=5),
+
+    # ── Wettbewerber-Vergleiche (Kaufsignal: jemand evaluiert Tools) ──────
+    dict(query='"SAP Signavio" OR "Celonis" OR "LeanIX" alternative comparison',
+         include_domains=["linkedin.com"], search_depth="advanced", max_results=5),
+    dict(query='"BPM software" OR "process management tool" evaluation 2025 2026',
+         include_domains=["linkedin.com/pulse"], search_depth="advanced", max_results=5),
+
+    # ── SAP S/4HANA – heissestes Kaufsignal ──────────────────────────────
+    dict(query='"SAP S/4HANA" transformation "process documentation" OR "process management"',
+         include_domains=["linkedin.com"], search_depth="advanced", max_results=5),
+    dict(query='"S/4HANA" migration "business process" 2025 2026',
+         include_domains=["linkedin.com/pulse"], search_depth="advanced", max_results=5),
+
+    # ── Compliance-Signale (DORA, NIS2, MaRisk, CSRD) ────────────────────
+    dict(query='DORA NIS2 "compliance management" OR "risk management" software',
+         include_domains=["linkedin.com"], search_depth="advanced", max_results=5),
+    dict(query='MaRisk "internal control" OR "GRC software" Banken Versicherung',
+         include_domains=["linkedin.com"], search_depth="advanced", max_results=5),
+    dict(query='CSRD ESG "sustainability reporting" software enterprise',
+         include_domains=["linkedin.com"], search_depth="advanced", max_results=5),
+
+    # ── Process Mining als Einstieg ───────────────────────────────────────
+    dict(query='"Process Mining" enterprise "inefficiency" OR "bottleneck" OR "optimization"',
+         include_domains=["linkedin.com"], search_depth="advanced", max_results=5),
+
+    # ── No-Code / Workflow Automation ─────────────────────────────────────
+    dict(query='"workflow automation" "no code" OR "low code" enterprise 2025',
+         include_domains=["linkedin.com/pulse"], search_depth="advanced", max_results=5),
+
+    # ── Enterprise Architecture ───────────────────────────────────────────
+    dict(query='"enterprise architecture" "IT rationalization" OR "application portfolio" 2025 2026',
+         include_domains=["linkedin.com"], search_depth="advanced", max_results=5),
+
+    # ── Branchen-spezifisch ───────────────────────────────────────────────
+    dict(query='"business process management" finance insurance banking 2025',
+         include_domains=["linkedin.com"], search_depth="advanced", max_results=5),
+    dict(query='"process excellence" OR "digital transformation" manufacturing automotive 2025',
+         include_domains=["linkedin.com"], search_depth="advanced", max_results=5),
 ]
 
 
@@ -129,38 +169,62 @@ def run_tavily_searches() -> list:
 
 
 # ---------------------------------------------------------------------------
-# Quelle 2: Apify – LinkedIn Post Search (echte Posts + Kommentare)
+# Quelle 2: Apify  –  echte LinkedIn-Posts
 # ---------------------------------------------------------------------------
 
-# Präzise Keyword-Kombinationen – kein nacktes "BPM" oder "GRC"
-APOFY_QUERIES = [
-    {"keywords": "GBTEC BIC Platform",              "sortBy": "date_posted", "datePosted": "past-week", "maxPosts": 20},
-    {"keywords": "GBTEC \"business process management\"","sortBy": "date_posted", "datePosted": "past-week", "maxPosts": 15},
-    {"keywords": "GBTEC Process Mining",             "sortBy": "date_posted", "datePosted": "past-week", "maxPosts": 15},
-    {"keywords": "GBTEC GRC Compliance",             "sortBy": "date_posted", "datePosted": "past-week", "maxPosts": 15},
-    {"keywords": "\"BIC Process Design\"",            "sortBy": "date_posted", "datePosted": "past-month", "maxPosts": 10},
-    {"keywords": "\"BIC Platform\" workflow",         "sortBy": "date_posted", "datePosted": "past-month", "maxPosts": 10},
-    {"keywords": "\"business process management\" software enterprise 2025", "sortBy": "date_posted", "datePosted": "past-week", "maxPosts": 15},
-    {"keywords": "\"Process Mining\" enterprise automation","sortBy": "date_posted", "datePosted": "past-week", "maxPosts": 15},
+APIFY_QUERIES = [
+    # GBTEC-Produkte direkt
+    {"keywords": "GBTEC BIC Platform",                    "sortBy": "date_posted", "datePosted": "past-week",  "maxPosts": 20},
+    {"keywords": "GBTEC Process Mining Apromore",         "sortBy": "date_posted", "datePosted": "past-week",  "maxPosts": 15},
+    {"keywords": "GBTEC GRC Compliance",                  "sortBy": "date_posted", "datePosted": "past-week",  "maxPosts": 15},
+    {"keywords": "\"BIC Process Design\"",                "sortBy": "date_posted", "datePosted": "past-month", "maxPosts": 10},
+    {"keywords": "\"BIC EAM\" enterprise architecture",   "sortBy": "date_posted", "datePosted": "past-month", "maxPosts": 10},
+
+    # Kaufsignal: SAP S/4HANA + Prozesse
+    {"keywords": "\"S/4HANA\" \"process management\" OR \"process documentation\"",
+                                                          "sortBy": "date_posted", "datePosted": "past-week",  "maxPosts": 20},
+
+    # Kaufsignal: Compliance-Druck
+    {"keywords": "DORA NIS2 compliance software",         "sortBy": "date_posted", "datePosted": "past-week",  "maxPosts": 15},
+    {"keywords": "MaRisk \"internal control system\"",    "sortBy": "date_posted", "datePosted": "past-week",  "maxPosts": 10},
+    {"keywords": "CSRD ESG reporting enterprise software","sortBy": "date_posted", "datePosted": "past-week",  "maxPosts": 10},
+
+    # Kaufsignal: Tool-Evaluation / Wettbewerber
+    {"keywords": "\"SAP Signavio\" OR \"Celonis\" alternative",
+                                                          "sortBy": "date_posted", "datePosted": "past-week",  "maxPosts": 15},
+    {"keywords": "\"LeanIX\" OR \"ARIS\" OR \"Camunda\" alternative",
+                                                          "sortBy": "date_posted", "datePosted": "past-month", "maxPosts": 10},
+
+    # Kaufsignal: Prozessproblem / Effizienz
+    {"keywords": "\"process inefficiency\" OR \"lack of process transparency\" enterprise",
+                                                          "sortBy": "date_posted", "datePosted": "past-week",  "maxPosts": 15},
+    {"keywords": "\"workflow automation\" \"no code\" enterprise 2025",
+                                                          "sortBy": "date_posted", "datePosted": "past-week",  "maxPosts": 15},
+
+    # Branchen-Signale
+    {"keywords": "\"business process management\" finance banking insurance",
+                                                          "sortBy": "date_posted", "datePosted": "past-week",  "maxPosts": 15},
+    {"keywords": "\"process excellence\" manufacturing automotive 2025",
+                                                          "sortBy": "date_posted", "datePosted": "past-week",  "maxPosts": 10},
 ]
 
-APOFY_ACTOR = "apimaestro/linkedin-posts-search-scraper-no-cookies"
-APOFY_RUN_URL = f"https://api.apify.com/v2/acts/{APIFY_ACTOR}/run-sync-get-dataset-items"
+APIFY_ACTOR  = "apimaestro/linkedin-posts-search-scraper-no-cookies"
+APIFY_RUN_URL = f"https://api.apify.com/v2/acts/{APIFY_ACTOR}/run-sync-get-dataset-items"
 
 
 def run_apify_searches() -> list:
-    if not APOFY_TOKEN:
+    if not APIFY_TOKEN:
         print("  Apify-Token nicht gesetzt – Apify-Suche übersprungen.")
         return []
 
     seen_urls: set = set()
-    results   = []
+    results = []
 
-    for q in APOFY_QUERIES:
+    for q in APIFY_QUERIES:
         try:
             resp = requests.post(
                 APIFY_RUN_URL,
-                params={"token": APOFY_TOKEN},
+                params={"token": APIFY_TOKEN},
                 json=q,
                 timeout=120,
             )
@@ -174,8 +238,8 @@ def run_apify_searches() -> list:
                     continue
                 seen_urls.add(url)
 
-                author_name = ""
                 author = post.get("actor") or post.get("author") or {}
+                author_name = ""
                 if isinstance(author, dict):
                     author_name = author.get("actor_name") or author.get("name", "")
 
@@ -188,7 +252,7 @@ def run_apify_searches() -> list:
                     "query":   q["keywords"],
                 })
 
-            time.sleep(2)   # kurze Pause zwischen Runs
+            time.sleep(2)
 
         except Exception as e:
             print(f"  Apify-Fehler bei '{q['keywords']}': {e}")
@@ -202,27 +266,22 @@ def run_apify_searches() -> list:
 # ---------------------------------------------------------------------------
 
 def filter_by_relevance(raw_items: list) -> list:
-    """
-    Schickt alle Rohergebnisse in einem einzigen Claude-Call.
-    Claude gibt eine JSON-Liste der relevanten Indizes zurück.
-    """
     if not raw_items:
         return []
 
-    # Kompakte Darstellung für den Prompt
     items_text = ""
     for i, item in enumerate(raw_items):
         snippet = (item.get("content") or "")[:300].replace("\n", " ")
         items_text += f"[{i}] TITLE: {item['title']}\n    SNIPPET: {snippet}\n\n"
 
-    prompt = f"""Du bist ein strenger Relevanz-Filter für einen BPM/GRC-Software-Experten.
+    prompt = f"""Du bist ein strenger Relevanz-Filter fuer einen GBTEC-Software-Berater.
 
 {RELEVANCE_CONTEXT}
 
 Unten sind nummerierte Eintraege (Index in eckigen Klammern).
-Gib NUR eine JSON-Liste der Indizes zurueck, die WIRKLICH relevant sind.
+Gib NUR eine JSON-Liste der Indizes zurueck, die ein echtes Kaufsignal oder relevanten Kontext enthalten.
 Beispiel-Antwort: [0, 2, 5, 7]
-Keine Erklaerung, kein Text ausserhalb der JSON-Liste.
+Kein Text ausserhalb der JSON-Liste.
 
 Eintraege:
 {items_text}"""
@@ -230,12 +289,10 @@ Eintraege:
     try:
         response = anthropic_client.messages.create(
             model="claude-sonnet-4-6",
-            max_tokens=500,
+            max_tokens=600,
             messages=[{"role": "user", "content": prompt}],
         )
         raw = response.content[0].text.strip()
-        # Sicherheits-Parse: extrahiere die erste [...]-Liste
-        import re, json
         match = re.search(r'\[.*?\]', raw, re.DOTALL)
         if not match:
             print("  Relevanz-Filter: keine gueltige JSON-Liste – behalte alle")
@@ -250,7 +307,7 @@ Eintraege:
 
 
 # ---------------------------------------------------------------------------
-# Deduplizierung gegen Datenbank
+# Deduplizierung gegen DB
 # ---------------------------------------------------------------------------
 
 def filter_new(items: list, db: dict) -> tuple[list, list]:
@@ -273,7 +330,7 @@ def filter_new(items: list, db: dict) -> tuple[list, list]:
 
 
 # ---------------------------------------------------------------------------
-# E-Mail aufbauen
+# E-Mail
 # ---------------------------------------------------------------------------
 
 def build_sources_html(items: list) -> str:
@@ -286,11 +343,11 @@ def build_sources_html(items: list) -> str:
         snippet = (item.get("content") or "")[:200].strip()
         if snippet and not snippet.endswith("…"):
             snippet += "…"
-        source_badge = "🔵 LinkedIn" if item.get("source") == "apify" else "🌐 Web"
+        badge = "🔵 LinkedIn-Post" if item.get("source") == "apify" else "🌐 Web/Artikel"
         rows += f"""
         <tr>
           <td style="padding:8px 6px; border-bottom:1px solid #eee; vertical-align:top;">
-            <span style="font-size:11px; color:#888;">{source_badge}</span><br>
+            <span style="font-size:11px; color:#888;">{badge}</span><br>
             <a href="{url}" style="color:#0a66c2; font-weight:bold;">{title}</a><br>
             <span style="font-size:12px; color:#666;">{snippet}</span>
           </td>
@@ -303,38 +360,52 @@ def build_sources_html(items: list) -> str:
 
 
 def summarize_with_claude(items: list) -> str:
-    # Kontext für Claude aufbauen
     context = ""
     for item in items:
         source  = "LinkedIn Post" if item.get("source") == "apify" else "Web/Artikel"
         snippet = (item.get("content") or "")[:500]
         context += f"SOURCE: {source}\nTITLE: {item['title']}\nURL: {item['url']}\nSNIPPET: {snippet}\n\n"
 
-    prompt = f"""Du bist ein Business-Intelligence-Assistent fuer einen Sales-Experten im Bereich Finance-Software und BPM (Business Process Management).
+    prompt = f"""Du bist ein Sales-Intelligence-Assistent fuer einen Berater, der GBTEC-Software (BIC Platform) verkauft.
 
-Alle unten stehenden Eintraege sind bereits auf Relevanz geprueft und beziehen sich ausschliesslich auf:
-- Business Process Management (BPM), Process Mining, GRC, EAM
-- GBTEC und deren Produkte (BIC Platform, BIC Process Design, BIC GRC, BIC EAM etc.)
+GBTEC-Produktportfolio zur Orientierung:
+- BIC Process Design: BPM, Prozessmodellierung, SAP S/4HANA-Integration
+- BIC EAM: Enterprise Architecture, IT-Rationalisierung, Application Portfolio
+- BIC Process Execution: Workflow-Automatisierung, No-Code/Low-Code
+- BIC GRC: Risikomanagement, Compliance, DORA/NIS2/MaRisk/CSRD
+- Apromore Process Mining: Prozessanalyse, Bottleneck-Erkennung
+Zielbranchen: Finance/Insurance, Manufacturing, Automotive, Energy, Healthcare
 
-Erstelle eine kompakte, deutsche Zusammenfassung in HTML mit diesen vier Abschnitten:
+Alle Eintraege sind bereits auf Relevanz geprueft.
+Erstelle eine strukturierte HTML-Zusammenfassung mit diesen Abschnitten:
 
-1. <h2>🏢 GBTEC Aktuell</h2> – Neuigkeiten, Posts, Ankuendigungen direkt von oder ueber GBTEC
-2. <h2>📊 BPM & GRC Trends</h2> – Branchentrends, neue Entwicklungen in BPM, GRC, Process Mining
-3. <h2>🌐 Was die Welt ueber GBTEC schreibt</h2> – Externe Medien, Blogs, Presse ueber GBTEC
-4. <h2>🔗 Top 5 Links</h2> – Die 5 relevantesten Links als <a href="URL">Titel</a>-Liste
+<h2>🏢 GBTEC & BIC Platform – Neuigkeiten</h2>
+Direkte Neuigkeiten, Posts, Ankuendigungen von/ueber GBTEC.
+
+<h2>🔥 Kaufsignale – Unternehmen mit konkretem Bedarf</h2>
+Posts wo Firmen ueber Probleme schreiben die GBTEC loest:
+SAP S/4HANA-Migration, Prozesschaos, Compliance-Druck (DORA/NIS2/MaRisk), Tool-Evaluierungen.
+Fuer jeden Treffer: Firmenname/Autor, beschriebenes Problem, welches GBTEC-Produkt passt, Link.
+
+<h2>📊 Markt & Wettbewerb</h2>
+Branchentrends, Wettbewerber-Erwaehnung, Marktentwicklungen.
+
+<h2>🔗 Top 5 Anknuepfungspunkte</h2>
+Die 5 vielversprechendsten Links fuer einen Sales-Kommentar oder Kontaktaufnahme.
+Format: <a href="URL">Titel</a> – Ein-Satz-Erklaerung warum relevant.
 
 Wichtig:
-- Verlinke Aussagen direkt mit der Quell-URL als <a href="...">Text</a>
-- Hebe Sales-Opportunities hervor (z.B. Unternehmen die BPM-Tools evaluieren, Probleme die GBTEC loesen koennte)
-- Schreibe praesize und professionell auf Deutsch
-- Kein Markdown, nur HTML-Tags
+- Verlinke Aussagen direkt als <a href="...">Text</a>
+- Hebe Firmennamen fett hervor wenn erkennbar
+- Schreibe praesize, professionell, auf Deutsch
+- Nur HTML, kein Markdown
 
 Eintraege:
 {context}"""
 
     response = anthropic_client.messages.create(
         model="claude-sonnet-4-6",
-        max_tokens=2000,
+        max_tokens=2500,
         messages=[{"role": "user", "content": prompt}],
     )
     return response.content[0].text
@@ -342,8 +413,7 @@ Eintraege:
 
 def send_email(summary_html: str, sources_html: str, counts: dict):
     today   = date.today().strftime("%d.%m.%Y")
-    total   = counts["total"]
-    subject = f"LinkedIn Digest – GBTEC & BPM – {today} ({total} neue Treffer)"
+    subject = f"Sales Digest – GBTEC BIC Platform – {today} ({counts['total']} neue Signale)"
 
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
@@ -360,15 +430,17 @@ def send_email(summary_html: str, sources_html: str, counts: dict):
     a {{ color: #0a66c2; }}
     .badge {{ background:#0a66c2; color:#fff; border-radius:4px; padding:2px 8px; font-size:11px; margin-right:4px; }}
     .badge-li {{ background:#00a0dc; }}
+    .badge-hot {{ background:#e03e2d; }}
     .footer {{ margin-top: 30px; font-size: 11px; color: #999; border-top: 1px solid #eee; padding-top: 10px; }}
   </style>
 </head>
 <body>
-  <h1 style="color:#333;">📋 Täglicher Digest – GBTEC & BPM</h1>
+  <h1 style="color:#333;">🎯 Täglicher Sales Digest – GBTEC BIC Platform</h1>
   <p style="color:#666;">
     {today} &nbsp;
-    <span class="badge">{counts['tavily']} Web-Artikel</span>
+    <span class="badge">{counts['tavily']} Web</span>
     <span class="badge badge-li">{counts['apify']} LinkedIn-Posts</span>
+    <span class="badge badge-hot">{counts['total']} neue Signale gesamt</span>
   </p>
   <hr>
 
@@ -378,9 +450,9 @@ def send_email(summary_html: str, sources_html: str, counts: dict):
   {sources_html}
 
   <div class="footer">
-    Nur neue Treffer – bereits bekannte Quellen werden nicht erneut angezeigt.<br>
-    Alle Ergebnisse wurden auf BPM/GRC-Relevanz gefiltert (kein Musik-BPM, kein Marketing-GRC).<br>
-    Quellen: Tavily Web-Suche + Apify LinkedIn Scraper + Claude Relevanz-Filter
+    Kaufsignale basierend auf gbtec.com-Produktanalyse.<br>
+    Filter: SAP S/4HANA, DORA/NIS2/MaRisk, Prozessmanagement, Tool-Evaluierungen, Wettbewerber-Erwaehnung.<br>
+    Quellen: Tavily + Apify LinkedIn Scraper + Claude Sales-Intelligence-Filter
   </div>
 </body>
 </html>"""
@@ -399,9 +471,8 @@ def send_email(summary_html: str, sources_html: str, counts: dict):
 def main():
     print("Lade Artikel-Datenbank...")
     db = load_db()
-    print(f"  {len(db)} bekannte Eintraege in der Datenbank.")
+    print(f"  {len(db)} bekannte Eintraege.")
 
-    # --- Suchen ---
     print("\n[1/4] Tavily Web-Suche...")
     tavily_raw = run_tavily_searches()
 
@@ -411,26 +482,24 @@ def main():
     all_raw = tavily_raw + apify_raw
     print(f"\n  Gesamt roh: {len(all_raw)} Eintraege")
 
-    # --- Relevanz-Filter ---
-    print("\n[3/4] Claude Relevanz-Filter...")
+    print("\n[3/4] Claude Relevanz- & Kaufsignal-Filter...")
     relevant_items = filter_by_relevance(all_raw)
 
-    # --- Deduplizierung gegen DB ---
     print("\n[4/4] Abgleich mit Datenbank...")
     new_db_rows, new_items = filter_new(relevant_items, db)
 
     tavily_new = sum(1 for i in new_items if i.get("source") != "apify")
     apify_new  = sum(1 for i in new_items if i.get("source") == "apify")
-    print(f"  Neu: {tavily_new} Web-Artikel, {apify_new} LinkedIn-Posts")
+    print(f"  Neu: {tavily_new} Web, {apify_new} LinkedIn-Posts")
 
     if not new_items:
-        print("\nKeine neuen relevanten Treffer – kein E-Mail-Versand.")
+        print("\nKeine neuen Kaufsignale – kein E-Mail-Versand.")
         return
 
-    print("\nSpeichere neue Eintraege in Datenbank...")
+    print("\nSpeichere neue Eintraege...")
     save_new_articles(new_db_rows)
 
-    print("Erstelle Claude-Zusammenfassung...")
+    print("Erstelle Claude Sales-Zusammenfassung...")
     summary_html = summarize_with_claude(new_items)
 
     print("Baue Quellenabschnitt...")
