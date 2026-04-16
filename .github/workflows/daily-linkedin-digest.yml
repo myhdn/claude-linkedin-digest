@@ -29,9 +29,10 @@ jobs:
       - name: Digest ausführen
         run: python digest.py
         env:
-          TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
+          TAVILY_API_KEY:   ${{ secrets.TAVILY_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          EMAIL_PASSWORD:   ${{ secrets.EMAIL_PASSWORD }}
+          APIFY_TOKEN:      ${{ secrets.APIFY_TOKEN }}
 
       - name: Artikel-Datenbank committen (falls aktualisiert)
         run: |
