@@ -9,9 +9,14 @@ jobs:
   run-digest:
     runs-on: ubuntu-latest
 
+    permissions:
+      contents: write  # Erlaubt Git-Commit für seen_articles.csv
+
     steps:
       - name: Repository auschecken
         uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Python einrichten
         uses: actions/setup-python@v5
@@ -27,3 +32,15 @@ jobs:
           TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+
+      - name: Artikel-Datenbank committen (falls aktualisiert)
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add seen_articles.csv
+          if git diff --cached --quiet; then
+            echo "Keine neuen Artikel – kein Commit nötig."
+          else
+            git commit -m "chore: update seen_articles.csv [$(date -u '+%Y-%m-%d')]"
+            git push
+          fi
