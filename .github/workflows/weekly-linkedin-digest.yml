@@ -1,0 +1,28 @@
+name: Weekly LinkedIn Digest
+
+on:
+  schedule:
+    - cron: '0 5 * * 1'  # Jeden Montag 05:00 UTC = 07:00 MESZ
+  workflow_dispatch:  # Manueller Start jederzeit möglich
+
+jobs:
+  run-digest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Python einrichten
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Abhängigkeiten installieren
+        run: pip install -r requirements.txt
+
+      - name: Digest ausführen
+        env:
+          TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+        run: python digest.py

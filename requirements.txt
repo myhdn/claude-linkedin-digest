@@ -1,4 +1,3 @@
 tavily-python
 anthropic
 python-dotenv
-requests
